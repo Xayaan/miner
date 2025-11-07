@@ -348,6 +348,16 @@ class Miner(BaseNode, Trainer):
         )
         self.outer_steps_per_shard = getattr(self.hparams, "outer_steps_per_shard")
 
+        # Track last sync check for periodic resyncing (matches startup pattern)
+        self.last_sync_check_window = -1
+        self.sync_check_interval = 5  # Check sync every 5 windows
+
+        # Background aggregator cache for faster catchup (disk-based)
+        self.aggregator_cache_dir = os.path.join("/tmp", f"aggregator_cache_{self.uid}")
+        os.makedirs(self.aggregator_cache_dir, exist_ok=True)
+        self.aggregator_cache_lock = asyncio.Lock()
+        self.background_aggregator_task: asyncio.Task | None = None
+
         tplr.logger.info("[Init] ✔ fully done – entering run()")
 
     # Main training loop.
@@ -416,6 +426,13 @@ class Miner(BaseNode, Trainer):
         )
 
         self.comms.start_commitment_fetcher()
+
+        # Start background aggregator downloader for faster catchup
+        if self.is_master:
+            self.background_aggregator_task = asyncio.create_task(
+                self._background_download_aggregators()
+            )
+            tplr.logger.info("Started background aggregator downloader")
 
         current_shard = self.global_step // self.outer_steps_per_shard
         tplr.logger.info(
@@ -926,6 +943,144 @@ class Miner(BaseNode, Trainer):
 
             dist_helper.safe_barrier("post_outer_step", self.local_rank)
 
+            # Runtime sync check (matches startup pattern in handle_checkpoint_catchup)
+            # Only master rank decides when to check to avoid desync
+            should_check_sync = False
+            if self.is_master:
+                should_check_sync = (step_window - self.last_sync_check_window) >= self.sync_check_interval
+            
+            # Broadcast whether to check sync to all ranks
+            check_tensor = torch.tensor([1 if should_check_sync else 0], dtype=torch.long, device=self.device)
+            dist_helper.broadcast(check_tensor, src=0)
+            should_check_sync = bool(check_tensor.item())
+            
+            if should_check_sync:
+                # Runtime sync check - works exactly like startup: reload checkpoint then catchup
+                need_catchup = False
+                
+                if self.is_master:
+                    tplr.logger.info(
+                        f"Performing periodic sync check (window {step_window}, "
+                        f"last check: {self.last_sync_check_window})"
+                    )
+                    
+                    try:
+                        # Get leader validator's debug dict from previous window
+                        leader_uid = self.comms.metagraph.S.argmax().item()
+                        debug_result = await self.comms.get(
+                            uid=str(leader_uid),
+                            window=self.current_window - 1,
+                            key="debug",
+                            local=False,
+                            stale_retention=10,
+                        )
+                        
+                        if debug_result.success and isinstance(debug_result.data, dict):
+                            # Use existing function to check steps behind (same as validator)
+                            comparison_metrics = await tplr.neurons.compare_model_with_debug_dict(
+                                model=self.model,
+                                debug_dict=debug_result.data,
+                                learning_rate=self.outer_scheduler.get_last_lr()[0],
+                            )
+                            
+                            if comparison_metrics["success"]:
+                                avg_steps_behind = comparison_metrics["avg_steps_behind"]
+                                l2_norm = comparison_metrics["l2_norm"]
+                                
+                                # Calculate sync score using the formula: score = (1-x/5)^2.5 (same as validator)
+                                x = min(avg_steps_behind, 5.0)
+                                sync_score = max(0.0, (1.0 - x / 5.0) ** 2.5)
+                                
+                                tplr.logger.info(
+                                    f"[Sync Check] Steps behind: {avg_steps_behind:.2f}, "
+                                    f"L2 norm: {l2_norm:.4f}, Sync score: {sync_score:.4f}"
+                                )
+                                
+                                # Decide if catchup is needed (same logic as startup: ckpt_sync_win < current_window)
+                                if avg_steps_behind > 1.0:
+                                    tplr.logger.warning(
+                                        f"⚠️ Miner detected {avg_steps_behind:.2f} steps behind validator "
+                                        f"(sync_score={sync_score:.4f}). Reloading checkpoint and catching up..."
+                                    )
+                                    need_catchup = True
+                                else:
+                                    tplr.logger.info(
+                                        f"✓ Miner sync status OK: {avg_steps_behind:.2f} steps behind "
+                                        f"(sync_score={sync_score:.4f})"
+                                    )
+                            else:
+                                tplr.logger.warning("Could not verify sync status: comparison failed")
+                        else:
+                            tplr.logger.debug(
+                                f"No debug dict available from leader validator {leader_uid} "
+                                f"for window {self.current_window - 1}"
+                            )
+                    except Exception as e:
+                        tplr.logger.warning(f"Error checking sync status: {e}", exc_info=True)
+                    
+                    self.last_sync_check_window = step_window
+                
+                # Barrier to ensure master rank finishes checking before broadcast
+                dist_helper.safe_barrier("pre_sync_check_broadcast", self.local_rank)
+                
+                # Broadcast catchup decision to all ranks
+                catchup_tensor = torch.tensor([1 if need_catchup else 0], dtype=torch.long, device=self.device)
+                dist_helper.broadcast(catchup_tensor, src=0)
+                need_catchup = bool(catchup_tensor.item())
+                
+                # All ranks participate in catchup if needed (exactly like startup)
+                if need_catchup:
+                    # Reload latest checkpoint and catchup (faster with pre-downloaded aggregators)
+                    tplr.logger.info("Runtime sync check: reloading latest checkpoint and catching up...")
+                    
+                    # Use consolidated checkpoint loading function (same as startup)
+                    # This loads the latest checkpoint available
+                    (
+                        ckpt_ok,
+                        ckpt_sync_win,
+                        ckpt_global_step,
+                        from_bootstrap,
+                    ) = await tplr.neurons.load_checkpoint_with_fallback(self)
+                    
+                    # Use cached aggregators from disk for faster catchup
+                    # Temporarily inject aggregator cache into catchup function
+                    original_get = self.comms.get
+                    async def cached_get_with_fallback(*args, **kwargs):
+                        # If requesting aggregator and we have it cached on disk, return cached version
+                        if kwargs.get("key") == "aggregator" and "window" in kwargs:
+                            window = kwargs["window"]
+                            cached = await self._load_aggregator_from_disk(window)
+                            if cached is not None:
+                                # Create a mock result object matching CommsGetResult
+                                result = SimpleNamespace()
+                                result.success = True
+                                result.data = {
+                                    "state_dict": vars(cached.state_dict),
+                                    "uids": cached.uids,
+                                    "skipped_uids": cached.skipped_uids,
+                                    "success_rate": cached.success_rate,
+                                }
+                                tplr.logger.info(f"Using cached aggregator from disk for window {window}")
+                                return result
+                        # Otherwise use original get
+                        return await original_get(*args, **kwargs)
+                    
+                    # Temporarily replace comms.get with cached version
+                    if self.is_master:
+                        self.comms.get = cached_get_with_fallback
+                    
+                    try:
+                        # Handle catch-up and scheduler replay using consolidated logic (same as startup)
+                        await tplr.neurons.handle_checkpoint_catchup(
+                            self, ckpt_ok, ckpt_sync_win, ckpt_global_step, from_bootstrap
+                        )
+                    finally:
+                        # Restore original get function
+                        if self.is_master:
+                            self.comms.get = original_get
+                    
+                    tplr.logger.info("Runtime catchup completed successfully")
+
             # Delete any remaining local variables to clear up memory
             del shard_gradient
             if gather_result is not None:
@@ -939,6 +1094,147 @@ class Miner(BaseNode, Trainer):
             # 4. Wait for next window
             tplr.logger.info("Wait for next window...")
             await self.wait_until_window(step_window + 1)
+
+    def _get_cache_path(self, window: int) -> str:
+        """Get disk cache path for a window's aggregator."""
+        return os.path.join(self.aggregator_cache_dir, f"aggregator_{window}.pt")
+    
+    def _is_cached(self, window: int) -> bool:
+        """Check if aggregator is cached on disk."""
+        return os.path.exists(self._get_cache_path(window))
+    
+    async def _save_aggregator_to_disk(self, window: int, gather_ns: SimpleNamespace) -> None:
+        """Save aggregator to disk cache."""
+        cache_path = self._get_cache_path(window)
+        # Convert SimpleNamespace to dict for serialization
+        cache_data = {
+            "state_dict": vars(gather_ns.state_dict),
+            "uids": gather_ns.uids,
+            "skipped_uids": gather_ns.skipped_uids,
+            "success_rate": gather_ns.success_rate,
+        }
+        await asyncio.to_thread(torch.save, cache_data, cache_path)
+    
+    async def _load_aggregator_from_disk(self, window: int) -> SimpleNamespace | None:
+        """Load aggregator from disk cache."""
+        cache_path = self._get_cache_path(window)
+        if not os.path.exists(cache_path):
+            return None
+        
+        try:
+            cache_data = await asyncio.to_thread(torch.load, cache_path, map_location="cpu")
+            # Re-create SimpleNamespace (same as original code)
+            gather_ns = SimpleNamespace(
+                state_dict=SimpleNamespace(**cache_data["state_dict"]),
+                uids=cache_data.get("uids", []),
+                skipped_uids=cache_data.get("skipped_uids", []),
+                success_rate=cache_data.get("success_rate", 0.0),
+            )
+            return gather_ns
+        except Exception as e:
+            tplr.logger.debug(f"Failed to load cached aggregator for window {window}: {e}")
+            # Remove corrupted cache file
+            try:
+                os.remove(cache_path)
+            except:
+                pass
+            return None
+    
+    def _cleanup_old_cache(self, max_cache_windows: int = 20) -> None:
+        """Remove old cache files, keeping only the most recent ones."""
+        try:
+            # Get all cache files with their windows
+            cache_files = []
+            for filename in os.listdir(self.aggregator_cache_dir):
+                if filename.startswith("aggregator_") and filename.endswith(".pt"):
+                    try:
+                        window = int(filename.replace("aggregator_", "").replace(".pt", ""))
+                        cache_path = os.path.join(self.aggregator_cache_dir, filename)
+                        cache_files.append((window, cache_path, os.path.getmtime(cache_path)))
+                    except ValueError:
+                        continue
+            
+            # Sort by window number
+            cache_files.sort(key=lambda x: x[0])
+            
+            # Remove oldest if we exceed max
+            if len(cache_files) > max_cache_windows:
+                to_remove = cache_files[:-max_cache_windows]
+                for _, cache_path, _ in to_remove:
+                    try:
+                        os.remove(cache_path)
+                        tplr.logger.debug(f"Removed old cache file: {cache_path}")
+                    except Exception as e:
+                        tplr.logger.debug(f"Failed to remove cache file {cache_path}: {e}")
+        except Exception as e:
+            tplr.logger.debug(f"Error cleaning up cache: {e}")
+
+    async def _background_download_aggregators(self) -> None:
+        """
+        Background task to download aggregators for recent windows and save to disk.
+        This makes catchup much faster by having aggregators pre-downloaded.
+        """
+        leader_uid = self.comms.metagraph.S.argmax().item()
+        max_cache_windows = 20  # Keep last 20 windows in cache
+        
+        while not self.stop_event.is_set():
+            try:
+                await asyncio.sleep(30)  # Check every 30 seconds
+                
+                if self.stop_event.is_set():
+                    break
+                
+                # Download aggregators for recent windows
+                current_w = self.current_window
+                for window in range(max(0, current_w - max_cache_windows), current_w):
+                    # Skip if already cached on disk
+                    if self._is_cached(window):
+                        continue
+                    
+                    try:
+                        # Use same parameters as original catchup_with_aggregation_server
+                        fetch = await self.comms.get(
+                            uid=str(leader_uid),
+                            window=window,
+                            key="aggregator",
+                            timeout=60,  # Match original timeout
+                            local=False,
+                            stale_retention=10,
+                            map_location="cpu",  # Download to CPU
+                        )
+                        
+                        # Same check and processing as original code
+                        if fetch.success and fetch.data is not None and "state_dict" in fetch.data:
+                            payload = fetch.data
+                            
+                            # Re-create the SimpleNamespace expected by outer_step (same as original)
+                            gather_ns = SimpleNamespace(
+                                state_dict=SimpleNamespace(**payload["state_dict"]),
+                                uids=payload.get("uids", []),
+                                skipped_uids=payload.get("skipped_uids", []),
+                                success_rate=payload.get("success_rate", 0.0),
+                            )
+                            
+                            # Clear the original payload dict to free memory immediately (same as original)
+                            del payload
+                            if hasattr(fetch, "data"):
+                                fetch.data = None
+                            del fetch
+                            
+                            # Save to disk cache
+                            await self._save_aggregator_to_disk(window, gather_ns)
+                            
+                            tplr.logger.debug(f"Background: cached aggregator for window {window} to disk")
+                            
+                            # Cleanup old cache files
+                            self._cleanup_old_cache(max_cache_windows)
+                    except Exception as e:
+                        tplr.logger.debug(f"Background: failed to download aggregator for window {window}: {e}")
+                        continue
+                
+            except Exception as e:
+                tplr.logger.warning(f"Error in background aggregator downloader: {e}", exc_info=True)
+                await asyncio.sleep(60)  # Wait longer on error
 
     async def cleanup_window(self):
         """Aggressive memory cleanup between windows"""
