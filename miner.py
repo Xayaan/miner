@@ -348,6 +348,10 @@ class Miner(BaseNode, Trainer):
         )
         self.outer_steps_per_shard = getattr(self.hparams, "outer_steps_per_shard")
 
+        # Track last sync check for periodic resyncing
+        self.last_sync_check_window = -1
+        self.sync_check_interval = 5  # Check sync every 10 windows
+
         tplr.logger.info("[Init] ✔ fully done – entering run()")
 
     # Main training loop.
@@ -415,15 +419,31 @@ class Miner(BaseNode, Trainer):
             self, ckpt_ok, ckpt_sync_win, ckpt_global_step, from_bootstrap
         )
 
+        tplr.logger.info(f"[Miner] rank {self.rank}: Starting commitment fetcher...")
+        print(f"[Miner] rank {self.rank}: Starting commitment fetcher...", flush=True)
         self.comms.start_commitment_fetcher()
+        tplr.logger.info(f"[Miner] rank {self.rank}: Commitment fetcher started")
+        print(f"[Miner] rank {self.rank}: Commitment fetcher started", flush=True)
 
         current_shard = self.global_step // self.outer_steps_per_shard
         tplr.logger.info(
             f"Starting with global_step={self.global_step} (actual outer steps)"
         )
+        print(f"[Miner] rank {self.rank}: global_step={self.global_step}, current_shard={current_shard}", flush=True)
 
         # Initialize datasets (only rank 0 downloads, handled internally by dataset_manager)
-        _ = await self.dataset_manager.initialize_datasets(current_shard)
+        dataset_path = os.getenv('DATASET_BINS_PATH', 'NOT SET')
+        tplr.logger.info(f"[Miner] rank {self.rank}: About to initialize datasets for shard {current_shard}, DATASET_BINS_PATH={dataset_path}")
+        print(f"[Miner] rank {self.rank}: About to initialize datasets for shard {current_shard}, DATASET_BINS_PATH={dataset_path}", flush=True)
+        
+        try:
+            _ = await self.dataset_manager.initialize_datasets(current_shard)
+            tplr.logger.info(f"[Miner] rank {self.rank}: Dataset initialization completed for shard {current_shard}")
+            print(f"[Miner] rank {self.rank}: Dataset initialization completed", flush=True)
+        except Exception as e:
+            tplr.logger.error(f"[Miner] rank {self.rank}: Dataset initialization FAILED: {e}", exc_info=True)
+            print(f"[Miner] rank {self.rank}: Dataset initialization FAILED: {e}", flush=True)
+            raise
 
         # Synchronize all ranks after dataset initialization
         dist_helper.safe_barrier("dataset_init_complete", self.local_rank)
@@ -508,6 +528,15 @@ class Miner(BaseNode, Trainer):
             null_round = dist_helper.all_agree(
                 warmup_null or no_peers_null, self.device, "null_round_check"
             )
+            
+            # Check sync status periodically (every N windows) - AFTER barriers
+            if self.is_master and (step_window - self.last_sync_check_window) >= self.sync_check_interval:
+                tplr.logger.info(
+                    f"Performing periodic sync check (window {step_window}, "
+                    f"last check: {self.last_sync_check_window})"
+                )
+                await self.check_and_resync_if_needed()
+                self.last_sync_check_window = step_window
 
             if null_round:
                 if warmup_null:
@@ -939,6 +968,92 @@ class Miner(BaseNode, Trainer):
             # 4. Wait for next window
             tplr.logger.info("Wait for next window...")
             await self.wait_until_window(step_window + 1)
+
+    async def check_and_resync_if_needed(self) -> None:
+        """
+        Check if miner is behind validators and resync if needed.
+        Can be called periodically or manually to maintain sync score.
+        """
+        if not self.is_master:
+            return
+        
+        try:
+            # Get leader validator's debug dict from previous window
+            leader_uid = self.comms.metagraph.S.argmax().item()
+            debug_result = await self.comms.get(
+                uid=str(leader_uid),
+                window=self.current_window - 1,  # Previous window for comparison
+                key="debug",
+                local=False,
+                stale_retention=10,
+            )
+            
+            if debug_result.success and isinstance(debug_result.data, dict):
+                comparison = await tplr.neurons.compare_model_with_debug_dict(
+                    model=self.model,
+                    debug_dict=debug_result.data,
+                    learning_rate=self.lr,
+                    index_range=(10, 12),
+                    param_avg_change={},  # Could track this if needed
+                )
+                
+                if comparison["success"]:
+                    avg_steps_behind = comparison.get("avg_steps_behind", 0.0)
+                    l2_norm = comparison.get("l2_norm", 0.0)
+                    
+                    # Calculate sync score (same formula as validator)
+                    x = min(avg_steps_behind, 5.0)
+                    sync_score = max(0.0, (1.0 - x / 5.0) ** 2.5)
+                    
+                    tplr.logger.info(
+                        f"[Sync Check] Steps behind: {avg_steps_behind:.2f}, "
+                        f"L2 norm: {l2_norm:.4f}, Sync score: {sync_score:.4f}"
+                    )
+                    
+                    # Resync threshold: if more than 2 steps behind, trigger catchup
+                    if avg_steps_behind > 1.0:
+                        tplr.logger.warning(
+                            f"⚠️ Miner detected {avg_steps_behind:.2f} steps behind validator "
+                            f"(sync_score={sync_score:.4f}). Triggering catchup..."
+                        )
+                        
+                        # Calculate which window to catchup from
+                        # Estimate how many windows behind we are
+                        windows_behind = max(1, int(avg_steps_behind))
+                        catchup_start_window = max(
+                            self.start_window,
+                            self.current_window - windows_behind - 1
+                        )
+                        
+                        tplr.logger.info(
+                            f"Starting catchup from window {catchup_start_window} "
+                            f"to current window {self.current_window}"
+                        )
+                        
+                        # Trigger catchup
+                        await tplr.neurons.catchup_with_aggregation_server(
+                            instance=self,
+                            checkpoint_current_window=catchup_start_window,
+                            aggregator_device=self.config.device,
+                        )
+                        
+                        tplr.logger.info("✓ Catchup completed successfully, model is now in sync")
+                    else:
+                        tplr.logger.debug(
+                            f"✓ Miner sync status OK: {avg_steps_behind:.2f} steps behind "
+                            f"(sync_score={sync_score:.4f})"
+                        )
+                else:
+                    tplr.logger.warning(
+                        "Could not verify sync status: comparison failed"
+                    )
+            else:
+                tplr.logger.debug(
+                    f"No debug dict available from leader validator {leader_uid} "
+                    f"for window {self.current_window - 1}"
+                )
+        except Exception as e:
+            tplr.logger.error(f"Error checking/resyncing: {e}", exc_info=True)
 
     async def cleanup_window(self):
         """Aggressive memory cleanup between windows"""
